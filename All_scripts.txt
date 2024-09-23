@@ -1,0 +1,344 @@
+# Perform quality control analysis on fastq files using FastQC
+fastqc -o $PATH/ --noextract -t 2 -f fastq $PATH/${sample}*.fastq.gz
+
+# Trim adapters and low-quality bases using Trimmomatic
+java -jar trimmomatic-0.39.jar PE -threads 10 -phred33 $PATH/${sample}*.fastq.gz $PATH/${sample}*.fastq.gz -baseout $PATH/${sample}*_trimmed.fq ILLUMINACLIP:$PATH/TruSeq2OVR-PE.fa:2:30:10 LEADING:3 SLIDINGWINDOW:4:15 MINLEN:25
+
+# Align trimmed reads to a reference genome using BWA
+bwa mem -t 20 -M -R '@RG\tID:sample\tLB:sample\tPL:ILLUMINA\tPU:A00887\tSM:sample' $PATH/index_Enovo_ref/GCA_010078495.1_BGI_Enov.V1_genomic.fna $PATH/${sample}*_trimmed_1P.fq $PATH/${sample}*_trimmed_2P.fq > $PATH/${sample}*.sam 
+
+# Convert SAM to BAM, sort and remove duplicates using Samtools and Picard
+samtools view -q 20 -f 0x2 -bSh -@ 10 $PATH/${sample}*.sam > $PATH/${sample}*.bam
+samtools sort -o $PATH/${sample}*_sorted.bam -@ 10 $PATH/${sample}*.bam
+picard MarkDuplicates I=$PATH/${sample}*_sorted.bam O=$PATH/${sample}*_sorted_dedup.bam METRICS_FILE=$PATH/${sample}*_sorted_dedup.metrics.txt VALIDATION_STRINGENCY=LENIENT CREATE_INDEX=true CREATE_MD5_FILE=true TAGGING_POLICY=All ASSUME_SORT_ORDER=coordinate 
+
+# Calculate genome coverage
+samtools depth -a $PATH/${sample}.bam > $PATH/${sample}.coverage.txt
+
+# Calculate average coverage
+awk '{sum+=$3} END {print "Average coverage =",sum/NR}' coverage.txt
+
+# Perform realignment around indels using GATK
+gatk3 -nt 6 -T RealignerTargetCreator -R $PATH/REF.fna -I $PATH/${sample}_sorted_dedup.bam -o $PATH/${sample}.realn.intervals -allowPotentiallyMisencodedQuals -S LENIENT
+
+# Perform realignment around indels using GATK
+gatk3 -T IndelRealigner -R $PATH/REF.fna -I $PATH/${sample}_sorted_dedup.bam -targetIntervals $PATH/${sample}.realn.intervals -o $PATH/${sample}.realign.bam -allowPotentiallyMisencodedQuals -S LENIENT --generate_md5 
+
+# Variant calling, concatenation and normalization using bcftools
+bcftools mpileup -Ou -f $PATH/REF.fna -b $PATH/bam.filelist -d 10000 -q 10 -Q 20 -a DP,SP  --threads 2 | bcftools call -vm  -Oz -f GQ  -o $PATH/scaffolds.vcf.gz --threads 2
+bcftools concat -f $PATH/concat.list --threads 10 -Ov -o $PATH/unfiltered.vcf
+bcftools norm --check-ref w -f  $PATH/REF.fna  -o $PATH/unfiltered_norm.vcf.gz  -Oz --threads 8 $PATH/unfiltered.vcf
+
+# Indexing VCF file
+tabix -p vcf $PATH/unfiltered_norm.vcf.gz
+
+#basic Filtering
+
+vcftools --gzvcf $PATH/unfiltered_norm.vcf.gz --minQ 30  --max-missing 1  --min-meanDP 7.5 --max-meanDP 20 --minDP 3 --recode --recode-INFO-all --out $PATH/filter.vcf
+
+
+#Calculate Mean depth and missingness per individual
+%%bash
+module load vcftools
+vcftools --gzvcf spheniscus.vcf.gz\
+--out banded_penguins.stats \
+--depth
+
+ind, nSites, meanDepth = [], [], []
+with open("banded_penguins.stats.idepth") as ifile:
+    next(ifile)
+    for line in ifile:
+        row = line.strip("\n").split("\t")
+        ind.append(row[0])
+        nSites.append(int(row[1]))
+        meanDepth.append(float(row[2]))
+        
+plt.rcParams['figure.figsize'] = [18, 6]
+plt.axhline(10, ls="--", c="k")
+plt.axhline(np.nanmean(meanDepth), ls="--", c="k")
+for i in range(len(meanDepth)):
+    plt.plot((i, i), (0, meanDepth[i]), c="k", linewidth=1, ls="--")
+plt.scatter(ind, meanDepth, s=45, c="r", marker="+")
+plt.xticks(rotation = 90)
+plt.ylabel("Mean depth per individual", fontsize=18)
+plt.show()
+
+#Calculate missingness per individual
+%%bash
+module load vcftools
+vcftools --gzvcf Guanaco.vcf.gz \
+--out Guanaco.stats \
+--missing-indv
+
+ind, nData, nGeno, nMiss, fMiss = [], [], [], [], []
+with open("banded_penguins.stats.imiss") as ifile:
+    next(ifile)
+    for line in ifile:
+        row = line.strip("\n").split("\t")
+        ind.append(row[0])
+        nData.append(int(row[1]))
+        nGeno.append(int(row[2]))
+        nMiss.append(int(row[3]))
+        fMiss.append(float(row[4]))
+
+
+plt.rcParams['figure.figsize'] = [18, 6]
+#plt.axhline(1, ls="--", c="k")
+plt.axhline(0, ls="--", c="k")
+for i in range(len(fMiss)):
+    plt.plot((i, i), (0, fMiss[i]), c="k", linewidth=1, ls="--")
+plt.scatter(ind, fMiss, s=45, c="r", marker="+")
+plt.xticks(rotation = 90)
+plt.ylabel("Missingness per individual", fontsize=18)
+plt.show()
+
+##Selection analysis
+
+#Generate VCF for each population and for Chromosome
+
+BMW.txt 7g 8g 9g 10g 11g 12g 13g 14g
+
+FSP_GFZ.txt 30g 31g 32g 33g 34g 35g 36g 37g 38g 39g 40g
+
+GFZ.txt 36g 37g 38g 39g 40g
+
+NW.txt 1g 3g 4g 5g 6g
+
+#nSL
+#!/bin/bash
+#PBS -V
+#PBS -k eo
+#PBS -N splitvcf
+#PBS -l nodes=1:ppn=1
+#PBS -l walltime=100:00:00
+
+source activate ngs
+cd /data6/testacc/daly/codeml_camelidos/vcf
+
+vcftools --gzvcf Z3-lama-basic.vcf.gz --keep NW.txt --recode --out NW_lama-basic
+bcftools view -c 1 NW_lama-basic.recode.vcf -Oz -o NW_lama-basic.vcf.gz 
+
+vcftools --gzvcf Z3-lama-basic.vcf.gz --keep GFZ.txt --recode --out GFZ_lama-basic 
+bcftools view -c 1 GFZ_lama-basic.recode.vcf -Oz -o GFZ_lama-basic.vcf.gz 
+
+vcftools --gzvcf Z3-lama-basic.vcf.gz --keep FSP_GFZ.txt --recode --out FSP_GFZ_lama-basic 
+bcftools view -c 1 FSP_GFZ_lama-basic.recode.vcf -Oz -o FSP_GFZ_lama-basic.vcf.gz 
+
+vcftools --gzvcf Z3-lama-basic.vcf.gz --keep BMW.txt --recode --out BMW_lama-basic 
+bcftools view -c 1 BMW_lama-basic.recode.vcf -Oz -o BMW_lama-basic.vcf.gz 
+
+BMW_lama-basic.vcf.gz 
+bcftools query -f '%CHROM\n' BMW_lama-basic.vcf.gz | sort | uniq > ../nsl/BMW_scaffolds/chr_BMW.txt
+# 10468 scaffolds
+
+FSP_GFZ_lama-basic.vcf.gz 
+bcftools query -f '%CHROM\n' FSP_GFZ_lama-basic.vcf.gz | sort | uniq > ../nsl/FSP_GFZ_scaffolds/chr_FSP_GFZ.txt
+# 10457 scaffolds
+
+GFZ_lama-basic.vcf.gz 
+bcftools query -f '%CHROM\n' GFZ_lama-basic.vcf.gz | sort | uniq > ../nsl/GFZ_scaffolds/chr_GFZ.txt
+# 10257 scaffolds
+
+NW_lama-basic.vcf.gz 
+bcftools query -f '%CHROM\n' NW_lama-basic.vcf.gz | sort | uniq > ../nsl/NW_scaffolds/chr_NW.txt
+# 10121 scaffolds
+
+#############################################
+############## SPLIT SCAFFOLDS ##############
+#############################################
+
+#!/bin/bash
+#PBS -V
+#PBS -k eo
+#PBS -N NW_scaffolds
+#PBS -l nodes=1:ppn=2
+#PBS -l walltime=100:00:00
+
+cd /data6/testacc/daly/codeml_camelidos/nsl/NW_scaffolds
+
+VCF_FILE=/data6/testacc/daly/codeml_camelidos/vcf/NW_lama-basic.vcf.gz
+list=$(cat "chr_NW.txt")
+
+
+source activate ngs
+for i in $list;
+do 
+	vcftools  --vcf  $VCF_FILE  --chr $i  --recode --recode-INFO-all --out  $i&
+done
+wait
+
+
+#!/bin/bash
+#PBS -V
+#PBS -k eo
+#PBS -N GFZ_scaffolds
+#PBS -l nodes=1:ppn=2
+#PBS -l walltime=100:00:00
+
+cd /data6/testacc/daly/codeml_camelidos/nsl/GFZ_scaffolds
+
+VCF_FILE=/data6/testacc/daly/codeml_camelidos/vcf/GFZ_lama-basic.vcf.gz
+list=$(cat "chr_GFZ.txt")
+
+
+source activate ngs
+for i in $list;
+do 
+	vcftools  --vcf  $VCF_FILE  --chr $i  --recode --recode-INFO-all --out  $i&
+done
+wait
+
+
+#!/bin/bash
+#PBS -V
+#PBS -k eo
+#PBS -N FSP_GFZ_scaffolds
+#PBS -l nodes=1:ppn=2
+#PBS -l walltime=100:00:00
+
+cd /data6/testacc/daly/codeml_camelidos/nsl/FSP_GFZ_scaffolds
+
+VCF_FILE=/data6/testacc/daly/codeml_camelidos/vcf/FSP_GFZ_lama-basic.vcf.gz
+list=$(cat "chr_FSP_GFZ.txt")
+
+
+source activate ngs
+for i in $list;
+do 
+	vcftools  --vcf  $VCF_FILE  --chr $i  --recode --recode-INFO-all --out  $i&
+done
+wait
+
+
+#!/bin/bash
+#PBS -V
+#PBS -k eo
+#PBS -N BMW_scaffolds
+#PBS -l nodes=1:ppn=2
+#PBS -l walltime=100:00:00
+
+cd /data6/testacc/daly/codeml_camelidos/nsl/BMW_scaffolds
+
+VCF_FILE=/data6/testacc/daly/codeml_camelidos/vcf/BMW_lama-basic.vcf.gz
+list=$(cat "chr_BMW.txt")
+
+
+source activate ngs
+for i in $list;
+do 
+	vcftools  --vcf  $VCF_FILE  --chr $i  --recode --recode-INFO-all --out  $i&
+done
+wait
+
+
+#!/bin/bash
+scaff=/Users/dalynoll/Dropbox/TESIS_EBE/RESPALDO/seleccion_ventanas
+list=$(cat "$scaff/scaff_norm_sudeste.txt")
+for i in $list
+do
+awk '{print FILENAME " " $0}' ${i}.1.nsl.out.100bins.norm | sed 's/.1.nsl.out.100bins.norm//g' | sed 's/ .//g' > head_scaff/${i}.nsl.out.100bins_scaff.norm
+done
+
+
+
+
+
+
+
+###Structure and Demography paper GBE
+
+# Data Set 1B
+
+plink --vcf $PATH/filter.vcf --recode --out neutral --allow-extra-chr
+
+plink --file neutral --indep-pairwise 50 10 0.1 --allow-extra-chr
+
+plink --file neutral --extract plink.prune.in
+
+plink --vcf $PATH/filter.vcf --recode 12 --out $PATH/filter.ADMX --allow-extra-chr
+
+admixture --cv $PATH/filter.ADMX.ped $K -j8 | tee log${K}.out
+
+# Data Set 2A
+
+vcftools --gzvcf $PATH/filter{guanaco_pop}.vcf --maf 0.05  --recode --recode-INFO-all --out $PATH/filter{guanaco_pop}_MAF.vcf
+
+plink --vcf $PATH/filter{guanaco_pop}_MAF.vcf --recode --out neutral_{guanaco_pop} --allow-extra-chr
+
+plink --file {guanaco_pop} --indep-pairwise 50 10 0.1 --allow-extra-chr
+
+plink --file {guanaco_pop} --extract plink.prune.in
+
+plink --vcf $PATH/filter{guanaco_pop}_MAF.vcf --recode 12 --out $PATH/filter_{guanaco_pop}.ADMX --allow-extra-chr
+
+admixture --cv $PATH/filter_{guanaco_pop}.ped $K -j8 | tee log${K}.out
+
+for m in {1..10}; do
+    for i in {1..10}; do
+        # Generate random seed
+        s=$RANDOM
+        treemix -i banded_penguin.txt.gz -o guanaco_pop.${i}.${m} -global -m ${m} -k 500 -seed ${s}
+    done
+done
+
+tar -zcvf /guanaco_pop_dir.tar.gz
+
+https://rfitak.shinyapps.io/OptM/
+
+bed2diffs_v1 --bfile /guanaco_pop --nthreads 2 
+runeems_snps --params guanaco_pop.ini
+
+#Data Set 3A
+
+samtools mpileup -C50 -uf $REF $PATH/${sample}.realign.bam  | bcftools view -c - | vcfutils.pl vcf2fq -d 15  -D 45 | gzip > $PATH/diploid_${sample}.fq.gz
+fq2psmcfa -q20 $PATH/diploid_${sample}.fq.gz > $PATH/${sample}.psmcfa
+psmc -N25 -t15 -r5 -p "4+25*2+4+6" -o $PATH/${sample}.psmc  $PATH/${sample}.psmcfa
+
+#Data Set 3B
+
+samtools mpileup -C50 -uf $REF $PATH/${sample}.realign.bam  | bcftools view -c - | vcfutils.pl vcf2fq -d 3  -D 14 | gzip > $PATH/diploid_${sample}.fq.gz
+fq2psmcfa -q20 $PATH/diploid_${sample}.fq.gz > $PATH/${sample}.psmcfa
+psmc -N25 -t15 -r5 -p "4+25*2+4+6" -o $PATH/${sample}.psmc  $PATH/${sample}.psmcfa
+
+# Data Set4
+
+vcftools --gzvcf $PATH/filter{guanaco_pop}.vcf --maf 0.05  --recode --recode-INFO-all --out $PATH/filter{guanaco_pop}_MAF.vcf
+
+plink --vcf $PATH/filter{guanaco_pop}_MAF.vcf --recode --out neutral_{guanaco_pop} --allow-extra-chr
+
+plink --file {guanaco_pop} --indep-pairwise 50 10 0.1 --allow-extra-chr
+
+plink --file {guanaco_pop} --extract plink.prune.in
+
+~/angsd/angsd -gl 1 \
+-anc $PATH/REF.fna \
+-ref $PATH/REF.fna \
+-bam $PATH/guanaco_pop.filelist \
+-rf $PATH/NoCDS.angsd.regions \
+-out $PATH/POP \
+-dosaf 1 \
+-baq 1 \
+-C 50 \
+-minMapQ 30 \
+-minQ 20 \
+-P 20
+
+java -cp stairway_plot_es Stairbuilder SP_blueprint
+bash SP_blueprint.sh
+
+
+bcftools consensus -s ${sample} -f $REF $VCF -o $FASTA/${sample}_consenso.fa
+
+gffread Camel.gff  -g $REF -x guanaco_pop -C  -V -H  -J
+
+phyluce_probe_run_multiple_lastzs_sqlite --db test.sqlite --output $PATH/UCE/test-lastz --scaffoldlist list --genome-base-path . --probefile $PATH/UCE/uce-5k-probes.fasta --cores 8
+
+phyluce_probe_slice_sequence_from_genomes --lastz $PATH/UCE/test-lastz --conf $PATH/UCE/genomes.conf --flank 750 --name-pattern "uce-5k-probes.fasta_v_{}.lastz.clean" --output $PATH/UCE/test_fasta
+
+mafft guanaco_pop.fasta > aligned_sequences.fasta
+
+iqtree -s guanaco_pop_UCE_alignment.fasta -m GTR+G4 -bb 1000 -nt 4 -o guanaco_pop_UCE_tree.nwk
+
+iqtree -s guanaco_pop_CDS_alignment.fasta -m GTR+G4 -bb 1000 -nt 4 -o guanaco_pop_UCE_tree.nwk
+
+iqtree -s guanaco_pop_exon_alignment.fasta -m GTR+G4 -bb 1000 -nt 4 -o guanaco_pop_UCE_tree.nwk
